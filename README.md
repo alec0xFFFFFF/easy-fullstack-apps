@@ -248,50 +248,364 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 ```
 
-Create `apps/web/app/routes/api+/auth.tsx` for iOS authentication:
+## 🔐 Step 2.4: Stytch SMS Authentication Setup
+
+### 2.4.1 Configure Stytch
+
+1. **Create Stytch Account**:
+   - Go to [Stytch Dashboard](https://stytch.com/dashboard)
+   - Create a new project
+   - Get your Project ID and Secret
+
+2. **Install Stytch SDK**:
+   ```bash
+   cd apps/web
+   npm install stytch
+   ```
+
+3. **Environment Variables**:
+   ```bash
+   # Add to apps/web/.env
+   STYTCH_PROJECT_ID="project-test-..."
+   STYTCH_SECRET="secret-test-..."
+   ```
+
+### 2.4.2 Database Schema Updates
+
+Update `apps/web/prisma/schema.prisma` to support Stytch authentication:
+
+```prisma
+// User model with Stytch integration
+model User {
+  id    String @id @default(cuid())
+  email String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  image    UserImage?
+  notes    Note[]
+  roles    Role[]
+  session  Session[]
+  
+  // Stytch and app-specific fields
+  items       Item[]
+  phone       String?  @unique
+  connections Connection[]
+
+  @@map("users")
+}
+
+// Connection model for provider authentication
+model Connection {
+  id           String @id @default(cuid())
+  providerName String
+  providerId   String
+  userId       String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerName, providerId])
+  @@map("connections")
+}
+
+// Session model for secure authentication
+model Session {
+  id             String   @id @default(cuid())
+  expirationDate DateTime
+  userId         String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// Your app models
+model Item {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  category    String?
+  quantity    Int      @default(1)
+  userId      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("items")
+}
+```
+
+### 2.4.3 Stytch Service Implementation
+
+Create `apps/web/app/utils/stytch.server.ts`:
+
+```typescript
+import { Client } from 'stytch';
+
+const stytch = new Client({
+  project_id: process.env.STYTCH_PROJECT_ID!,
+  secret: process.env.STYTCH_SECRET!,
+});
+
+export { stytch };
+```
+
+### 2.4.4 Authentication Route for SMS
+
+Create `apps/web/app/routes/api+/login.tsx`:
 
 ```typescript
 import { json, type ActionFunctionArgs } from "@remix-run/node";
-import { login, requireUserId } from "~/utils/auth.server";
+import { stytch } from "~/utils/stytch.server";
 import { prisma } from "~/utils/db.server";
+import { createSession } from "~/utils/session.server";
 
 export async function action({ request }: ActionFunctionArgs) {
   const formData = await request.formData();
-  const action = formData.get("action");
+  const flow = formData.get("flow") as string;
   
-  switch (action) {
-    case "login": {
-      const email = formData.get("email") as string;
-      const password = formData.get("password") as string;
-      
-      const user = await login({ email, password });
-      
-      if (!user) {
-        return json({ error: "Invalid credentials" }, { status: 401 });
+  try {
+    switch (flow) {
+      case "send": {
+        const phoneNumber = formData.get("phoneNumber") as string;
+        
+        // Send SMS with Stytch
+        const response = await stytch.otps.sms.send({
+          phone_number: phoneNumber,
+          expiration_minutes: 5,
+        });
+        
+        return json({ 
+          success: true, 
+          methodId: response.method_id 
+        });
       }
       
-      return json({ user, token: "session-token" }); // Implement proper JWT
+      case "verify": {
+        const methodId = formData.get("methodId") as string;
+        const code = formData.get("code") as string;
+        
+        // Verify SMS code with Stytch
+        const response = await stytch.otps.authenticate({
+          method_id: methodId,
+          code: code,
+        });
+        
+        if (response.status_code === 200) {
+          const phoneNumber = response.phone_number;
+          
+          // Find or create user and connection
+          let connection = await prisma.connection.findUnique({
+            where: {
+              providerName_providerId: {
+                providerName: "stytch",
+                providerId: phoneNumber,
+              },
+            },
+            include: { user: true },
+          });
+          
+          if (!connection) {
+            // Create new user and connection
+            const user = await prisma.user.create({
+              data: {
+                phone: phoneNumber,
+                email: `${phoneNumber}@temp.com`, // Temporary email
+                connections: {
+                  create: {
+                    providerName: "stytch",
+                    providerId: phoneNumber,
+                  },
+                },
+              },
+            });
+            
+            connection = await prisma.connection.findUnique({
+              where: {
+                providerName_providerId: {
+                  providerName: "stytch",
+                  providerId: phoneNumber,
+                },
+              },
+              include: { user: true },
+            });
+          }
+          
+          if (connection) {
+            // Create session
+            const session = await createSession(connection.user.id);
+            
+            return json({ 
+              success: true, 
+              user: {
+                id: connection.user.id,
+                phone: connection.user.phone,
+                email: connection.user.email,
+              },
+              sessionId: session.id,
+            }, {
+              headers: {
+                "Set-Cookie": await commitSession(session),
+              },
+            });
+          }
+        }
+        
+        return json({ error: "Invalid verification code" }, { status: 400 });
+      }
+      
+      default:
+        return json({ error: "Invalid flow" }, { status: 400 });
     }
-    
-    case "me": {
-      const userId = await requireUserId(request);
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          email: true,
-          createdAt: true,
-          phone: true,
+  } catch (error) {
+    console.error('Authentication error:', error);
+    return json({ error: "Authentication failed" }, { status: 500 });
+  }
+}
+```
+
+### 2.4.5 Secure API Routes
+
+Create `apps/web/app/routes/api+/items.tsx` with proper authentication:
+
+```typescript
+import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
+import { requireUserId } from "~/utils/auth.server";
+import { prisma } from "~/utils/db.server";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const userId = await requireUserId(request);
+  
+  const items = await prisma.item.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" },
+  });
+  
+  return json({ items });
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const userId = await requireUserId(request);
+  const formData = await request.formData();
+  const method = request.method;
+  
+  switch (method) {
+    case "POST": {
+      const name = formData.get("name") as string;
+      const description = formData.get("description") as string;
+      const imageUrl = formData.get("imageUrl") as string;
+      const category = formData.get("category") as string;
+      const quantity = parseInt(formData.get("quantity") as string) || 1;
+      
+      const item = await prisma.item.create({
+        data: {
+          name,
+          description,
+          imageUrl,
+          category,
+          quantity,
+          userId,
         },
       });
       
-      return json({ user });
+      return json({ item });
+    }
+    
+    case "PUT": {
+      const id = formData.get("id") as string;
+      const name = formData.get("name") as string;
+      const description = formData.get("description") as string;
+      const quantity = parseInt(formData.get("quantity") as string) || 1;
+      
+      const item = await prisma.item.update({
+        where: { id, userId },
+        data: { name, description, quantity },
+      });
+      
+      return json({ item });
+    }
+    
+    case "DELETE": {
+      const id = formData.get("id") as string;
+      
+      await prisma.item.delete({
+        where: { id, userId },
+      });
+      
+      return json({ success: true });
     }
     
     default:
-      return json({ error: "Invalid action" }, { status: 400 });
+      return json({ error: "Method not allowed" }, { status: 405 });
   }
 }
+```
+
+### 2.4.6 Session Management
+
+Update `apps/web/app/utils/session.server.ts`:
+
+```typescript
+import { createCookieSessionStorage } from "@remix-run/node";
+import { prisma } from "./db.server";
+
+const sessionStorage = createCookieSessionStorage({
+  cookie: {
+    name: "__session",
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    secrets: [process.env.SESSION_SECRET!],
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30, // 30 days
+  },
+});
+
+export async function createSession(userId: string) {
+  const session = await prisma.session.create({
+    data: {
+      userId,
+      expirationDate: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30), // 30 days
+    },
+  });
+  
+  const cookieSession = await sessionStorage.getSession();
+  cookieSession.set("sessionId", session.id);
+  
+  return cookieSession;
+}
+
+export async function requireUserId(request: Request) {
+  const cookie = request.headers.get("Cookie");
+  const session = await sessionStorage.getSession(cookie);
+  const sessionId = session.get("sessionId");
+  
+  if (!sessionId) {
+    throw new Response("Unauthorized", { status: 401 });
+  }
+  
+  const dbSession = await prisma.session.findUnique({
+    where: { id: sessionId },
+    include: { user: true },
+  });
+  
+  if (!dbSession || dbSession.expirationDate < new Date()) {
+    throw new Response("Unauthorized", { status: 401 });
+  }
+  
+  return dbSession.userId;
+}
+
+export const { getSession, commitSession, destroySession } = sessionStorage;
+```
 ```
 
 ## 📱 Step 3: iOS App Setup
@@ -368,7 +682,7 @@ let package = Package(
 )
 ```
 
-### 3.4 iOS API Client
+### 3.4 iOS API Client with Stytch Authentication
 
 Create `apps/ios-project/YourApp/Services/APIClient.swift`:
 
@@ -381,22 +695,196 @@ class APIClient: ObservableObject {
     private let baseURL = "https://yourdomain.com" // Your Railway app URL
     private let session = URLSession.shared
     
-    private init() {}
+    @Published var isAuthenticated = false
+    @Published var currentUser: User?
     
-    // MARK: - Authentication
+    private init() {
+        loadStoredSession()
+    }
     
-    func login(email: String, password: String) async throws -> AuthResponse {
-        let url = URL(string: "\(baseURL)/api/auth")!
+    // MARK: - Session Management
+    
+    private func loadStoredSession() {
+        if let sessionData = UserDefaults.standard.data(forKey: "user_session"),
+           let user = try? JSONDecoder().decode(User.self, from: sessionData) {
+            self.currentUser = user
+            self.isAuthenticated = true
+        }
+    }
+    
+    private func saveSession(_ user: User) {
+        if let encoded = try? JSONEncoder().encode(user) {
+            UserDefaults.standard.set(encoded, forKey: "user_session")
+        }
+        self.currentUser = user
+        self.isAuthenticated = true
+    }
+    
+    private func clearSession() {
+        UserDefaults.standard.removeObject(forKey: "user_session")
+        self.currentUser = nil
+        self.isAuthenticated = false
+    }
+    
+    // MARK: - Stytch SMS Authentication
+    
+    func sendSMSCode(to phoneNumber: String) async throws -> SMSResponse {
+        let url = URL(string: "\(baseURL)/api/login")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         
-        let formData = "action=login&email=\(email)&password=\(password)"
+        let formData = "flow=send&phoneNumber=\(phoneNumber)"
         request.httpBody = formData.data(using: .utf8)
         
-        let (data, _) = try await session.data(for: request)
-        return try JSONDecoder().decode(AuthResponse.self, from: data)
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.networkError
+        }
+        
+        return try JSONDecoder().decode(SMSResponse.self, from: data)
     }
+    
+    func verifyCode(methodId: String, code: String) async throws -> AuthResponse {
+        let url = URL(string: "\(baseURL)/api/login")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        
+        let formData = "flow=verify&methodId=\(methodId)&code=\(code)"
+        request.httpBody = formData.data(using: .utf8)
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.networkError
+        }
+        
+        if httpResponse.statusCode == 200 {
+            let authResponse = try JSONDecoder().decode(AuthResponse.self, from: data)
+            if let user = authResponse.user {
+                saveSession(user)
+            }
+            return authResponse
+        } else {
+            let errorResponse = try JSONDecoder().decode(ErrorResponse.self, from: data)
+            throw APIError.authenticationFailed(errorResponse.error)
+        }
+    }
+    
+    func logout() {
+        clearSession()
+    }
+    
+    // MARK: - Authenticated API Calls
+    
+    private func authenticatedRequest(url: URL, method: String = "GET", body: Data? = nil) async throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        
+        if let body = body {
+            request.httpBody = body
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        }
+        
+        // Add session cookie for authentication
+        if let sessionData = UserDefaults.standard.data(forKey: "user_session") {
+            // In production, you might want to store and send the session cookie
+            // For now, we rely on the web app's session management
+        }
+        
+        return request
+    }
+    
+    func fetchItems() async throws -> [Item] {
+        let url = URL(string: "\(baseURL)/api/items")!
+        let request = try await authenticatedRequest(url: url)
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.networkError
+        }
+        
+        let itemsResponse = try JSONDecoder().decode(ItemsResponse.self, from: data)
+        return itemsResponse.items
+    }
+    
+    func createItem(name: String, description: String? = nil, imageUrl: String? = nil, category: String? = nil, quantity: Int = 1) async throws -> Item {
+        let url = URL(string: "\(baseURL)/api/items")!
+        
+        var formData = "name=\(name)&quantity=\(quantity)"
+        if let description = description {
+            formData += "&description=\(description)"
+        }
+        if let imageUrl = imageUrl {
+            formData += "&imageUrl=\(imageUrl)"
+        }
+        if let category = category {
+            formData += "&category=\(category)"
+        }
+        
+        let request = try await authenticatedRequest(
+            url: url,
+            method: "POST",
+            body: formData.data(using: .utf8)
+        )
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.networkError
+        }
+        
+        let itemResponse = try JSONDecoder().decode(ItemResponse.self, from: data)
+        return itemResponse.item
+    }
+    
+    func updateItem(_ item: Item) async throws -> Item {
+        let url = URL(string: "\(baseURL)/api/items")!
+        
+        let formData = "id=\(item.id)&name=\(item.name)&description=\(item.description ?? "")&quantity=\(item.quantity)"
+        
+        let request = try await authenticatedRequest(
+            url: url,
+            method: "PUT",
+            body: formData.data(using: .utf8)
+        )
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.networkError
+        }
+        
+        let itemResponse = try JSONDecoder().decode(ItemResponse.self, from: data)
+        return itemResponse.item
+    }
+    
+    func deleteItem(_ item: Item) async throws {
+        let url = URL(string: "\(baseURL)/api/items")!
+        
+        let formData = "id=\(item.id)"
+        
+        let request = try await authenticatedRequest(
+            url: url,
+            method: "DELETE",
+            body: formData.data(using: .utf8)
+        )
+        
+        let (data, response) = try await session.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.networkError
+        }
+    }
+}
     
     func getCurrentUser() async throws -> User {
         let url = URL(string: "\(baseURL)/api/auth")!
@@ -505,6 +993,513 @@ struct Item: Codable, Identifiable {
     let createdAt: String
     let updatedAt: String
 }
+
+// MARK: - Authentication Models
+
+struct User: Codable {
+    let id: String
+    let phone: String?
+    let email: String
+    let createdAt: String
+}
+
+struct AuthResponse: Codable {
+    let success: Bool
+    let user: User?
+    let sessionId: String?
+    let error: String?
+}
+
+struct SMSResponse: Codable {
+    let success: Bool
+    let methodId: String
+    let error: String?
+}
+
+struct ErrorResponse: Codable {
+    let error: String
+}
+
+// MARK: - API Response Models
+
+struct ItemsResponse: Codable {
+    let items: [Item]
+}
+
+struct ItemResponse: Codable {
+    let item: Item
+}
+
+// MARK: - API Errors
+
+enum APIError: Error, LocalizedError {
+    case networkError
+    case authenticationFailed(String)
+    case invalidData
+    
+    var errorDescription: String? {
+        switch self {
+        case .networkError:
+            return "Network error occurred"
+        case .authenticationFailed(let message):
+            return "Authentication failed: \(message)"
+        case .invalidData:
+            return "Invalid data received"
+        }
+    }
+}
+```
+
+### 3.5 iOS Authentication Views
+
+Create `apps/ios-project/YourApp/Views/LoginView.swift`:
+
+```swift
+import SwiftUI
+
+struct LoginView: View {
+    @StateObject private var apiClient = APIClient.shared
+    @State private var phoneNumber = ""
+    @State private var verificationCode = ""
+    @State private var methodId = ""
+    @State private var currentStep: AuthStep = .phoneEntry
+    @State private var isLoading = false
+    @State private var errorMessage = ""
+    @State private var showError = false
+    
+    enum AuthStep {
+        case phoneEntry
+        case codeVerification
+    }
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 24) {
+                VStack(spacing: 16) {
+                    Image(systemName: "phone.fill")
+                        .font(.system(size: 60))
+                        .foregroundColor(.blue)
+                    
+                    Text("Welcome to Your App")
+                        .font(.title)
+                        .fontWeight(.bold)
+                    
+                    Text("Enter your phone number to get started")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                
+                VStack(spacing: 16) {
+                    if currentStep == .phoneEntry {
+                        phoneEntryView
+                    } else {
+                        codeVerificationView
+                    }
+                }
+                
+                Spacer()
+            }
+            .padding()
+            .navigationBarHidden(true)
+            .alert("Error", isPresented: $showError) {
+                Button("OK") { }
+            } message: {
+                Text(errorMessage)
+            }
+        }
+    }
+    
+    private var phoneEntryView: some View {
+        VStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Phone Number")
+                    .font(.headline)
+                
+                TextField("Enter your phone number", text: $phoneNumber)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .keyboardType(.phonePad)
+                    .textContentType(.telephoneNumber)
+            }
+            
+            Button(action: sendSMSCode) {
+                HStack {
+                    if isLoading {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                            .foregroundColor(.white)
+                    }
+                    
+                    Text("Send Verification Code")
+                        .fontWeight(.medium)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.blue)
+                .foregroundColor(.white)
+                .cornerRadius(10)
+            }
+            .disabled(phoneNumber.isEmpty || isLoading)
+        }
+    }
+    
+    private var codeVerificationView: some View {
+        VStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Verification Code")
+                    .font(.headline)
+                
+                Text("Enter the code sent to \(phoneNumber)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                TextField("Enter verification code", text: $verificationCode)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .keyboardType(.numberPad)
+                    .textContentType(.oneTimeCode)
+            }
+            
+            Button(action: verifyCode) {
+                HStack {
+                    if isLoading {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                            .foregroundColor(.white)
+                    }
+                    
+                    Text("Verify Code")
+                        .fontWeight(.medium)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.blue)
+                .foregroundColor(.white)
+                .cornerRadius(10)
+            }
+            .disabled(verificationCode.isEmpty || isLoading)
+            
+            Button("Change Phone Number") {
+                currentStep = .phoneEntry
+                verificationCode = ""
+                methodId = ""
+            }
+            .foregroundColor(.blue)
+        }
+    }
+    
+    private func sendSMSCode() {
+        guard !phoneNumber.isEmpty else { return }
+        
+        isLoading = true
+        errorMessage = ""
+        
+        Task {
+            do {
+                let response = try await apiClient.sendSMSCode(to: phoneNumber)
+                
+                await MainActor.run {
+                    if response.success {
+                        methodId = response.methodId
+                        currentStep = .codeVerification
+                    } else {
+                        errorMessage = response.error ?? "Failed to send SMS"
+                        showError = true
+                    }
+                    isLoading = false
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showError = true
+                    isLoading = false
+                }
+            }
+        }
+    }
+    
+    private func verifyCode() {
+        guard !verificationCode.isEmpty, !methodId.isEmpty else { return }
+        
+        isLoading = true
+        errorMessage = ""
+        
+        Task {
+            do {
+                let response = try await apiClient.verifyCode(methodId: methodId, code: verificationCode)
+                
+                await MainActor.run {
+                    if response.success {
+                        // Authentication successful, APIClient will handle state updates
+                        isLoading = false
+                    } else {
+                        errorMessage = response.error ?? "Invalid verification code"
+                        showError = true
+                        isLoading = false
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showError = true
+                    isLoading = false
+                }
+            }
+        }
+    }
+}
+
+struct LoginView_Previews: PreviewProvider {
+    static var previews: some View {
+        LoginView()
+    }
+}
+```
+
+### 3.6 iOS Main App Integration
+
+Update `apps/ios-project/YourApp/YourAppApp.swift`:
+
+```swift
+import SwiftUI
+
+@main
+struct YourAppApp: App {
+    @StateObject private var apiClient = APIClient.shared
+    
+    var body: some Scene {
+        WindowGroup {
+            Group {
+                if apiClient.isAuthenticated {
+                    ContentView()
+                } else {
+                    LoginView()
+                }
+            }
+            .environmentObject(apiClient)
+        }
+    }
+}
+```
+
+### 3.7 iOS Content View with Authentication
+
+Update `apps/ios-project/YourApp/Views/ContentView.swift`:
+
+```swift
+import SwiftUI
+
+struct ContentView: View {
+    @EnvironmentObject var apiClient: APIClient
+    @State private var items: [Item] = []
+    @State private var isLoading = false
+    @State private var showingAddItem = false
+    
+    var body: some View {
+        NavigationView {
+            VStack {
+                if isLoading {
+                    ProgressView("Loading items...")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if items.isEmpty {
+                    emptyStateView
+                } else {
+                    itemsList
+                }
+            }
+            .navigationTitle("My Items")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button("Add Item") {
+                            showingAddItem = true
+                        }
+                        
+                        Button("Logout") {
+                            apiClient.logout()
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+            .sheet(isPresented: $showingAddItem) {
+                AddItemView { newItem in
+                    items.append(newItem)
+                }
+            }
+        }
+        .task {
+            await loadItems()
+        }
+    }
+    
+    private var emptyStateView: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "tray")
+                .font(.system(size: 60))
+                .foregroundColor(.gray)
+            
+            Text("No items yet")
+                .font(.title2)
+                .fontWeight(.medium)
+            
+            Text("Tap the menu button to add your first item")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding()
+    }
+    
+    private var itemsList: some View {
+        List {
+            ForEach(items, id: \.id) { item in
+                ItemRow(item: item)
+            }
+            .onDelete(perform: deleteItems)
+        }
+        .refreshable {
+            await loadItems()
+        }
+    }
+    
+    private func loadItems() async {
+        isLoading = true
+        
+        do {
+            let fetchedItems = try await apiClient.fetchItems()
+            await MainActor.run {
+                items = fetchedItems
+                isLoading = false
+            }
+        } catch {
+            await MainActor.run {
+                isLoading = false
+            }
+            print("Error loading items: \(error)")
+        }
+    }
+    
+    private func deleteItems(offsets: IndexSet) {
+        for index in offsets {
+            let item = items[index]
+            
+            Task {
+                do {
+                    try await apiClient.deleteItem(item)
+                    await MainActor.run {
+                        items.remove(at: index)
+                    }
+                } catch {
+                    print("Error deleting item: \(error)")
+                }
+            }
+        }
+    }
+}
+
+struct ItemRow: View {
+    let item: Item
+    
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.name)
+                    .font(.headline)
+                
+                if let description = item.description {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            Spacer()
+            
+            Text("\(item.quantity)")
+                .font(.caption)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.blue.opacity(0.1))
+                .foregroundColor(.blue)
+                .cornerRadius(8)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct AddItemView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var apiClient: APIClient
+    
+    @State private var name = ""
+    @State private var description = ""
+    @State private var quantity = 1
+    @State private var isLoading = false
+    
+    let onItemAdded: (Item) -> Void
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Item Details") {
+                    TextField("Name", text: $name)
+                    TextField("Description", text: $description)
+                    
+                    Stepper("Quantity: \(quantity)", value: $quantity, in: 1...999)
+                }
+            }
+            .navigationTitle("Add Item")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") {
+                        saveItem()
+                    }
+                    .disabled(name.isEmpty || isLoading)
+                }
+            }
+        }
+    }
+    
+    private func saveItem() {
+        isLoading = true
+        
+        Task {
+            do {
+                let newItem = try await apiClient.createItem(
+                    name: name,
+                    description: description.isEmpty ? nil : description,
+                    quantity: quantity
+                )
+                
+                await MainActor.run {
+                    onItemAdded(newItem)
+                    dismiss()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoading = false
+                }
+                print("Error creating item: \(error)")
+            }
+        }
+    }
+}
+
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .environmentObject(APIClient.shared)
+    }
+}
 ```
 
 ## 🚀 Step 4: Railway Deployment
@@ -579,9 +1574,435 @@ rm -rf app/routes/settings+/
 
 3. **Update app icons** in iOS project
 
-## 🔧 Step 6: Testing & Development
+## 🔒 Step 6: API Security & Best Practices
 
-### 6.1 Web Development
+### 6.1 Authentication Middleware
+
+Create `apps/web/app/utils/auth.server.ts` to secure your API endpoints:
+
+```typescript
+import { redirect } from "@remix-run/node";
+import { prisma } from "./db.server";
+import { getSession } from "./session.server";
+
+export async function requireUserId(request: Request) {
+  const cookie = request.headers.get("Cookie");
+  const session = await getSession(cookie);
+  const sessionId = session.get("sessionId");
+  
+  if (!sessionId) {
+    throw new Response("Unauthorized", { status: 401 });
+  }
+  
+  const dbSession = await prisma.session.findUnique({
+    where: { id: sessionId },
+    include: { user: true },
+  });
+  
+  if (!dbSession || dbSession.expirationDate < new Date()) {
+    throw new Response("Unauthorized", { status: 401 });
+  }
+  
+  return dbSession.userId;
+}
+
+export async function requireUser(request: Request) {
+  const userId = await requireUserId(request);
+  
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      phone: true,
+      createdAt: true,
+    },
+  });
+  
+  if (!user) {
+    throw new Response("User not found", { status: 404 });
+  }
+  
+  return user;
+}
+
+export async function requireAdminUser(request: Request) {
+  const user = await requireUser(request);
+  
+  const userWithRoles = await prisma.user.findUnique({
+    where: { id: user.id },
+    include: {
+      roles: {
+        include: {
+          permissions: true,
+        },
+      },
+    },
+  });
+  
+  const hasAdminRole = userWithRoles?.roles.some(
+    role => role.name === "admin"
+  );
+  
+  if (!hasAdminRole) {
+    throw new Response("Forbidden", { status: 403 });
+  }
+  
+  return user;
+}
+```
+
+### 6.2 Rate Limiting
+
+Create `apps/web/app/utils/rate-limit.server.ts`:
+
+```typescript
+import { LRUCache } from "lru-cache";
+
+const rateLimitCache = new LRUCache<string, number>({
+  max: 1000,
+  ttl: 60 * 1000, // 1 minute
+});
+
+export function rateLimit(
+  identifier: string,
+  maxRequests: number = 10,
+  windowMs: number = 60 * 1000
+) {
+  const key = `rate_limit:${identifier}`;
+  const currentCount = rateLimitCache.get(key) || 0;
+  
+  if (currentCount >= maxRequests) {
+    throw new Response("Too many requests", { status: 429 });
+  }
+  
+  rateLimitCache.set(key, currentCount + 1);
+}
+
+export function getClientIP(request: Request): string {
+  const forwardedFor = request.headers.get("X-Forwarded-For");
+  const realIP = request.headers.get("X-Real-IP");
+  
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  
+  if (realIP) {
+    return realIP;
+  }
+  
+  return "unknown";
+}
+```
+
+### 6.3 Input Validation
+
+Create `apps/web/app/utils/validation.server.ts`:
+
+```typescript
+import { z } from "zod";
+
+// Install zod: npm install zod
+
+export const ItemSchema = z.object({
+  name: z.string().min(1, "Name is required").max(100, "Name too long"),
+  description: z.string().max(500, "Description too long").optional(),
+  quantity: z.number().int().min(1, "Quantity must be at least 1").max(9999, "Quantity too large"),
+  category: z.string().max(50, "Category too long").optional(),
+  imageUrl: z.string().url("Invalid URL").optional(),
+});
+
+export const PhoneSchema = z.string().regex(
+  /^\+?[1-9]\d{1,14}$/,
+  "Invalid phone number format"
+);
+
+export const SMSCodeSchema = z.string().regex(
+  /^\d{6}$/,
+  "Verification code must be 6 digits"
+);
+
+export function validateFormData<T>(
+  schema: z.ZodSchema<T>,
+  data: FormData
+): T {
+  const object = Object.fromEntries(data.entries());
+  
+  // Convert string numbers to numbers
+  for (const [key, value] of Object.entries(object)) {
+    if (typeof value === "string" && !isNaN(Number(value)) && value !== "") {
+      object[key] = Number(value);
+    }
+  }
+  
+  const result = schema.safeParse(object);
+  
+  if (!result.success) {
+    const errors = result.error.errors.map(err => err.message).join(", ");
+    throw new Response(`Validation error: ${errors}`, { status: 400 });
+  }
+  
+  return result.data;
+}
+```
+
+### 6.4 Secure API Route Example
+
+Update `apps/web/app/routes/api+/items.tsx` with comprehensive security:
+
+```typescript
+import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
+import { requireUserId } from "~/utils/auth.server";
+import { rateLimit, getClientIP } from "~/utils/rate-limit.server";
+import { validateFormData, ItemSchema } from "~/utils/validation.server";
+import { prisma } from "~/utils/db.server";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  // Rate limiting
+  const clientIP = getClientIP(request);
+  rateLimit(`api_items_${clientIP}`, 100, 60 * 1000); // 100 requests per minute
+  
+  // Authentication
+  const userId = await requireUserId(request);
+  
+  // Pagination
+  const url = new URL(request.url);
+  const page = parseInt(url.searchParams.get("page") || "1");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
+  const skip = (page - 1) * limit;
+  
+  const [items, totalCount] = await Promise.all([
+    prisma.item.findMany({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+      skip,
+      take: limit,
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        imageUrl: true,
+        category: true,
+        quantity: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    }),
+    prisma.item.count({ where: { userId } }),
+  ]);
+  
+  return json({
+    items,
+    pagination: {
+      page,
+      limit,
+      totalCount,
+      totalPages: Math.ceil(totalCount / limit),
+    },
+  });
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const clientIP = getClientIP(request);
+  const method = request.method;
+  
+  // Rate limiting by method
+  switch (method) {
+    case "POST":
+      rateLimit(`api_items_create_${clientIP}`, 10, 60 * 1000); // 10 creates per minute
+      break;
+    case "PUT":
+      rateLimit(`api_items_update_${clientIP}`, 30, 60 * 1000); // 30 updates per minute
+      break;
+    case "DELETE":
+      rateLimit(`api_items_delete_${clientIP}`, 20, 60 * 1000); // 20 deletes per minute
+      break;
+  }
+  
+  // Authentication
+  const userId = await requireUserId(request);
+  const formData = await request.formData();
+  
+  switch (method) {
+    case "POST": {
+      const validatedData = validateFormData(ItemSchema, formData);
+      
+      const item = await prisma.item.create({
+        data: {
+          ...validatedData,
+          userId,
+        },
+        select: {
+          id: true,
+          name: true,
+          description: true,
+          imageUrl: true,
+          category: true,
+          quantity: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      
+      return json({ item }, { status: 201 });
+    }
+    
+    case "PUT": {
+      const id = formData.get("id") as string;
+      
+      if (!id) {
+        throw new Response("Item ID is required", { status: 400 });
+      }
+      
+      // Verify ownership
+      const existingItem = await prisma.item.findUnique({
+        where: { id },
+        select: { userId: true },
+      });
+      
+      if (!existingItem || existingItem.userId !== userId) {
+        throw new Response("Item not found", { status: 404 });
+      }
+      
+      const validatedData = validateFormData(ItemSchema.partial(), formData);
+      
+      const item = await prisma.item.update({
+        where: { id },
+        data: validatedData,
+        select: {
+          id: true,
+          name: true,
+          description: true,
+          imageUrl: true,
+          category: true,
+          quantity: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      
+      return json({ item });
+    }
+    
+    case "DELETE": {
+      const id = formData.get("id") as string;
+      
+      if (!id) {
+        throw new Response("Item ID is required", { status: 400 });
+      }
+      
+      // Verify ownership and delete
+      const deletedItem = await prisma.item.deleteMany({
+        where: { id, userId },
+      });
+      
+      if (deletedItem.count === 0) {
+        throw new Response("Item not found", { status: 404 });
+      }
+      
+      return json({ success: true });
+    }
+    
+    default:
+      throw new Response("Method not allowed", { status: 405 });
+  }
+}
+```
+
+### 6.5 iOS Security Considerations
+
+Update your iOS `APIClient.swift` to handle authentication properly:
+
+```swift
+// Add these properties to APIClient
+private var sessionCookie: String?
+
+// Update the authenticatedRequest method
+private func authenticatedRequest(url: URL, method: String = "GET", body: Data? = nil) async throws -> URLRequest {
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    
+    if let body = body {
+        request.httpBody = body
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    }
+    
+    // Add session cookie if available
+    if let sessionCookie = self.sessionCookie {
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+    }
+    
+    return request
+}
+
+// Update verifyCode method to capture session cookie
+func verifyCode(methodId: String, code: String) async throws -> AuthResponse {
+    // ... existing code ...
+    
+    let (data, response) = try await session.data(for: request)
+    
+    // Extract session cookie
+    if let httpResponse = response as? HTTPURLResponse,
+       let cookies = httpResponse.allHeaderFields["Set-Cookie"] as? String {
+        self.sessionCookie = cookies
+        UserDefaults.standard.set(cookies, forKey: "session_cookie")
+    }
+    
+    // ... rest of existing code ...
+}
+
+// Load session cookie on init
+private func loadStoredSession() {
+    if let sessionData = UserDefaults.standard.data(forKey: "user_session"),
+       let user = try? JSONDecoder().decode(User.self, from: sessionData) {
+        self.currentUser = user
+        self.isAuthenticated = true
+        self.sessionCookie = UserDefaults.standard.string(forKey: "session_cookie")
+    }
+}
+```
+
+### 6.6 Environment Variables Security
+
+Create secure environment configuration:
+
+```bash
+# Production Environment Variables
+NODE_ENV=production
+DATABASE_URL="postgresql://encrypted_connection_string"
+SESSION_SECRET="use-a-long-random-string-here"
+STYTCH_PROJECT_ID="project-live-xxx"
+STYTCH_SECRET="secret-live-xxx"
+
+# Rate Limiting
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX_REQUESTS=100
+
+# Security Headers
+SECURE_HEADERS_ENABLED=true
+HELMET_ENABLED=true
+```
+
+### 6.7 Security Headers
+
+Add security headers to your app:
+
+```typescript
+// Add to apps/web/app/root.tsx
+export function headers() {
+  return {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  };
+}
+```
+
+## 🔧 Step 7: Testing & Development
+
+### 7.1 Web Development
 
 ```bash
 cd apps/web
@@ -596,30 +2017,41 @@ npm run test
 npm run db:migrate
 ```
 
-### 6.2 iOS Development
+### 7.2 iOS Development
 
 1. Open `apps/ios-project/YourApp.xcworkspace` in Xcode
 2. Update bundle identifier and team
 3. Run on simulator or device
 
-### 6.3 API Testing
+### 7.3 API Testing with Stytch Authentication
 
-Test your API endpoints:
+Test your API endpoints with proper authentication:
 
 ```bash
-# Test items endpoint
+# Test SMS send
+curl -X POST "https://yourdomain.com/api/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "flow=send&phoneNumber=+1234567890"
+
+# Test SMS verify
+curl -X POST "https://yourdomain.com/api/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "flow=verify&methodId=METHOD_ID&code=123456"
+
+# Test authenticated items endpoint (with session cookie)
 curl -X GET "https://yourdomain.com/api/items" \
-  -H "Authorization: Bearer your-token"
+  -H "Cookie: __session=your-session-cookie"
 
 # Test create item
 curl -X POST "https://yourdomain.com/api/items" \
-  -H "Authorization: Bearer your-token" \
-  -d "name=Test Item&description=A test item"
+  -H "Cookie: __session=your-session-cookie" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "name=Test Item&description=A test item&quantity=1"
 ```
 
-## 📱 Step 7: iOS Build & Distribution
+## 📱 Step 8: iOS Build & Distribution
 
-### 7.1 Build Scripts
+### 8.1 Build Scripts
 
 Create `apps/ios-project/build-and-upload.sh`:
 
@@ -667,9 +2099,9 @@ xcrun altool --upload-app \
 echo "✅ Upload complete!"
 ```
 
-## 🎯 Step 8: Production Checklist
+## 🎯 Step 9: Production Checklist
 
-### 8.1 Epic Stack Features Already Included ✅
+### 9.1 Epic Stack Features Already Included ✅
 - [x] Authentication with sessions
 - [x] Database ORM with Prisma
 - [x] Email functionality
@@ -680,15 +2112,25 @@ echo "✅ Upload complete!"
 - [x] Error handling
 - [x] Security best practices
 
-### 8.2 Additional Configuration
+### 9.2 Stytch SMS Authentication Features ✅
+- [x] SMS-based passwordless authentication
+- [x] Secure session management
+- [x] Cross-platform authentication (web + iOS)
+- [x] Rate limiting and input validation
+- [x] Proper error handling
+- [x] Session persistence
+
+### 9.3 Additional Configuration
 - [ ] PostHog analytics configured
 - [ ] Railway deployment successful
 - [ ] iOS app signed and uploaded
-- [ ] API endpoints tested
+- [ ] Stytch production keys configured
+- [ ] API endpoints tested with authentication
 - [ ] Environment variables set
 - [ ] Domain configured
+- [ ] Security headers enabled
 
-## 🔄 Step 9: Continuous Integration
+## 🔄 Step 10: Continuous Integration
 
 The Epic Stack includes GitHub Actions out of the box. Update `.github/workflows/deploy.yml` for Railway:
 
